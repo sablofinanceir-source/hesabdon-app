@@ -1,25 +1,46 @@
-import cors from 'cors';
-import express from 'express';
-import rateLimit from 'express-rate-limit';
-import helmet from 'helmet';
-import morgan from 'morgan';
+import { connectDB, disconnectDB } from './config/db.js';
 import { env } from './config/env.js';
-import { errorHandler, notFoundHandler } from './middlewares/error.js';
-import routes from './modules/index.js';
+import { createApp } from './app.js';
+import { startScheduler } from './jobs/scheduler.js';
 
-export function createApp() {
-  const app = express();
-  app.set('trust proxy', 1);
+async function main() {
+  await connectDB();
 
-  app.use(helmet());
-  app.use(cors({ origin: env.corsOrigins === '*' ? true : env.corsOrigins.split(',').map((s) => s.trim()) }));
-  app.use(express.json({ limit: '1mb' }));
-  if (!env.isProd) app.use(morgan('dev'));
+  const app = createApp();
+  const server = app.listen(env.port, () => {
+    console.log(`🚀 Hesabdoon API on http://localhost:${env.port}/api/v1`);
+  });
 
-  app.use(rateLimit({ windowMs: 60 * 1000, limit: 300, standardHeaders: true, legacyHeaders: false }));
-  app.use('/api/v1', routes);
+  // روی Vercel تابع‌ها دائمی نیستند، پس scheduler فقط روی سرور واقعی/لوکال اجرا شود
+  const stopScheduler = process.env.VERCEL ? () => {} : startScheduler();
 
-  app.use(notFoundHandler);
-  app.use(errorHandler);
-  return app;
+  let shuttingDown = false;
+  const shutdown = (signal) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    console.log(`${signal} received, shutting down...`);
+
+    stopScheduler();
+
+    // اگر بسته شدن بیش از ۱۰ ثانیه طول کشید، اجباری خارج شو
+    setTimeout(() => process.exit(1), 10_000).unref();
+
+    server.close(async () => {
+      try {
+        await disconnectDB();
+        process.exit(0);
+      } catch (err) {
+        console.error('Error during shutdown:', err);
+        process.exit(1);
+      }
+    });
+  };
+
+  process.on('SIGINT', () => shutdown('SIGINT'));
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
 }
+
+main().catch((err) => {
+  console.error('Fatal startup error:', err);
+  process.exit(1);
+});
